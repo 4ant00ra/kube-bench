@@ -15,6 +15,7 @@
 package cmd
 
 import (
+	"github.com/magiconair/properties/assert"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -22,6 +23,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/aquasecurity/kube-bench/check"
 	"github.com/spf13/viper"
 )
 
@@ -109,38 +111,51 @@ func TestFindExecutable(t *testing.T) {
 
 func TestGetBinaries(t *testing.T) {
 	cases := []struct {
-		config map[string]interface{}
-		psOut  string
-		exp    map[string]string
+		config    map[string]interface{}
+		psOut     string
+		exp       map[string]string
+		expectErr bool
 	}{
 		{
-			config: map[string]interface{}{"components": []string{"apiserver"}, "apiserver": map[string]interface{}{"bins": []string{"apiserver", "kube-apiserver"}}},
-			psOut:  "kube-apiserver",
-			exp:    map[string]string{"apiserver": "kube-apiserver"},
+			config:    map[string]interface{}{"components": []string{"apiserver"}, "apiserver": map[string]interface{}{"bins": []string{"apiserver", "kube-apiserver"}}},
+			psOut:     "kube-apiserver",
+			exp:       map[string]string{"apiserver": "kube-apiserver"},
+			expectErr: false,
 		},
 		{
 			// "thing" is not in the list of components
-			config: map[string]interface{}{"components": []string{"apiserver"}, "apiserver": map[string]interface{}{"bins": []string{"apiserver", "kube-apiserver"}}, "thing": map[string]interface{}{"bins": []string{"something else", "thing"}}},
-			psOut:  "kube-apiserver thing",
-			exp:    map[string]string{"apiserver": "kube-apiserver"},
+			config:    map[string]interface{}{"components": []string{"apiserver"}, "apiserver": map[string]interface{}{"bins": []string{"apiserver", "kube-apiserver"}}, "thing": map[string]interface{}{"bins": []string{"something else", "thing"}}},
+			psOut:     "kube-apiserver thing",
+			exp:       map[string]string{"apiserver": "kube-apiserver"},
+			expectErr: false,
 		},
 		{
 			// "anotherthing" in list of components but doesn't have a defintion
-			config: map[string]interface{}{"components": []string{"apiserver", "anotherthing"}, "apiserver": map[string]interface{}{"bins": []string{"apiserver", "kube-apiserver"}}, "thing": map[string]interface{}{"bins": []string{"something else", "thing"}}},
-			psOut:  "kube-apiserver thing",
-			exp:    map[string]string{"apiserver": "kube-apiserver"},
+			config:    map[string]interface{}{"components": []string{"apiserver", "anotherthing"}, "apiserver": map[string]interface{}{"bins": []string{"apiserver", "kube-apiserver"}}, "thing": map[string]interface{}{"bins": []string{"something else", "thing"}}},
+			psOut:     "kube-apiserver thing",
+			exp:       map[string]string{"apiserver": "kube-apiserver"},
+			expectErr: false,
 		},
 		{
 			// more than one component
-			config: map[string]interface{}{"components": []string{"apiserver", "thing"}, "apiserver": map[string]interface{}{"bins": []string{"apiserver", "kube-apiserver"}}, "thing": map[string]interface{}{"bins": []string{"something else", "thing"}}},
-			psOut:  "kube-apiserver \nthing",
-			exp:    map[string]string{"apiserver": "kube-apiserver", "thing": "thing"},
+			config:    map[string]interface{}{"components": []string{"apiserver", "thing"}, "apiserver": map[string]interface{}{"bins": []string{"apiserver", "kube-apiserver"}}, "thing": map[string]interface{}{"bins": []string{"something else", "thing"}}},
+			psOut:     "kube-apiserver \nthing",
+			exp:       map[string]string{"apiserver": "kube-apiserver", "thing": "thing"},
+			expectErr: false,
 		},
 		{
 			// default binary to component name
-			config: map[string]interface{}{"components": []string{"apiserver", "thing"}, "apiserver": map[string]interface{}{"bins": []string{"apiserver", "kube-apiserver"}}, "thing": map[string]interface{}{"bins": []string{"something else", "thing"}, "optional": true}},
-			psOut:  "kube-apiserver \notherthing some params",
-			exp:    map[string]string{"apiserver": "kube-apiserver", "thing": "thing"},
+			config:    map[string]interface{}{"components": []string{"apiserver", "thing"}, "apiserver": map[string]interface{}{"bins": []string{"apiserver", "kube-apiserver"}}, "thing": map[string]interface{}{"bins": []string{"something else", "thing"}, "optional": true}},
+			psOut:     "kube-apiserver \notherthing some params",
+			exp:       map[string]string{"apiserver": "kube-apiserver", "thing": "thing"},
+			expectErr: false,
+		},
+		{
+			// missing mandatory component
+			config:    map[string]interface{}{"components": []string{"apiserver", "thing"}, "apiserver": map[string]interface{}{"bins": []string{"apiserver", "kube-apiserver"}}, "thing": map[string]interface{}{"bins": []string{"something else", "thing"}, "optional": true}},
+			psOut:     "otherthing some params",
+			exp:       map[string]string{"apiserver": "kube-apiserver", "thing": "thing"},
+			expectErr: true,
 		},
 	}
 
@@ -153,8 +168,12 @@ func TestGetBinaries(t *testing.T) {
 			for k, val := range c.config {
 				v.Set(k, val)
 			}
-			m := getBinaries(v)
-			if !reflect.DeepEqual(m, c.exp) {
+			m, err := getBinaries(v, check.MASTER)
+			if c.expectErr {
+				if err == nil {
+					t.Fatal("Got nil Expected error")
+				}
+			} else if !reflect.DeepEqual(m, c.exp) {
 				t.Fatalf("Got %v\nExpected %v", m, c.exp)
 			}
 		})
@@ -183,17 +202,21 @@ func TestMultiWordReplace(t *testing.T) {
 	}
 }
 
-func TestKubeVersionRegex(t *testing.T) {
-	ver := getVersionFromKubectlOutput(`Client Version: v1.8.0
-		Server Version: v1.8.12
-		`)
-	if ver != "1.8" {
-		t.Fatalf("Expected 1.8 got %s", ver)
+func Test_getVersionFromKubectlOutput(t *testing.T) {
+	ver := getVersionFromKubectlOutput(`{
+  "serverVersion": {
+    "major": "1",
+    "minor": "8",
+    "gitVersion": "v1.8.0"
+  }
+}`)
+	if ver.BaseVersion() != "1.8" {
+		t.Fatalf("Expected 1.8 got %s", ver.BaseVersion())
 	}
 
 	ver = getVersionFromKubectlOutput("Something completely different")
-	if ver != "1.6" {
-		t.Fatalf("Expected 1.6 got %s", ver)
+	if ver.BaseVersion() != defaultKubeVersion {
+		t.Fatalf("Expected %s got %s", defaultKubeVersion, ver.BaseVersion())
 	}
 }
 
@@ -281,7 +304,7 @@ func TestGetConfigFiles(t *testing.T) {
 			e = c.statResults
 			eIndex = 0
 
-			m := getConfigFiles(v)
+			m := getFiles(v, "config")
 			if !reflect.DeepEqual(m, c.exp) {
 				t.Fatalf("Got %v\nExpected %v", m, c.exp)
 			}
@@ -356,7 +379,7 @@ func TestGetServiceFiles(t *testing.T) {
 			e = c.statResults
 			eIndex = 0
 
-			m := getServiceFiles(v)
+			m := getFiles(v, "service")
 			if !reflect.DeepEqual(m, c.exp) {
 				t.Fatalf("Got %v\nExpected %v", m, c.exp)
 			}
@@ -369,17 +392,19 @@ func TestMakeSubsitutions(t *testing.T) {
 		input string
 		subst map[string]string
 		exp   string
+		expectedSubs []string
 	}{
-		{input: "Replace $thisbin", subst: map[string]string{"this": "that"}, exp: "Replace that"},
-		{input: "Replace $thisbin", subst: map[string]string{"this": "that", "here": "there"}, exp: "Replace that"},
-		{input: "Replace $thisbin and $herebin", subst: map[string]string{"this": "that", "here": "there"}, exp: "Replace that and there"},
+		{input: "Replace $thisbin", subst: map[string]string{"this": "that"}, exp: "Replace that", expectedSubs: []string{"that"}},
+		{input: "Replace $thisbin", subst: map[string]string{"this": "that", "here": "there"}, exp: "Replace that", expectedSubs: []string{"that"}},
+		{input: "Replace $thisbin and $herebin", subst: map[string]string{"this": "that", "here": "there"}, exp: "Replace that and there", expectedSubs: []string{"that", "there"}},
 	}
 	for _, c := range cases {
 		t.Run(c.input, func(t *testing.T) {
-			s := makeSubstitutions(c.input, "bin", c.subst)
+			s, subs := makeSubstitutions(c.input, "bin", c.subst)
 			if s != c.exp {
 				t.Fatalf("Got %s expected %s", s, c.exp)
 			}
+			assert.Equal(t, c.expectedSubs, subs)
 		})
 	}
 }
@@ -391,36 +416,188 @@ func TestGetConfigFilePath(t *testing.T) {
 		t.Fatalf("Failed to create temp directory")
 	}
 	defer os.RemoveAll(cfgDir)
-	d := filepath.Join(cfgDir, "1.8")
-	err = os.Mkdir(d, 0666)
+	d := filepath.Join(cfgDir, "cis-1.4")
+	err = os.Mkdir(d, 0766)
 	if err != nil {
-		t.Fatalf("Failed to create temp file")
+		t.Fatalf("Failed to create temp dir")
 	}
-	ioutil.WriteFile(filepath.Join(d, "master.yaml"), []byte("hello world"), 0666)
+	err = ioutil.WriteFile(filepath.Join(d, "master.yaml"), []byte("hello world"), 0666)
+	if err != nil {
+		t.Logf("Failed to create temp file")
+	}
 
 	cases := []struct {
-		specifiedVersion string
-		runningVersion   string
+		benchmarkVersion string
 		succeed          bool
 		exp              string
 	}{
-		{runningVersion: "1.8", succeed: true, exp: d},
-		{runningVersion: "1.9", succeed: true, exp: d},
-		{runningVersion: "1.10", succeed: true, exp: d},
-		{runningVersion: "1.1", succeed: false},
-		{specifiedVersion: "1.8", succeed: true, exp: d},
-		{specifiedVersion: "1.9", succeed: false},
-		{specifiedVersion: "1.10", succeed: false},
+		{benchmarkVersion: "cis-1.4", succeed: true, exp: d},
+		{benchmarkVersion: "cis-1.5", succeed: false, exp: ""},
+		{benchmarkVersion: "1.1", succeed: false, exp: ""},
 	}
 
 	for _, c := range cases {
-		t.Run(c.specifiedVersion+"-"+c.runningVersion, func(t *testing.T) {
-			path, err := getConfigFilePath(c.specifiedVersion, c.runningVersion, "/master.yaml")
-			if err != nil && c.succeed {
-				t.Fatalf("Error %v", err)
+		t.Run(c.benchmarkVersion, func(t *testing.T) {
+			path, err := getConfigFilePath(c.benchmarkVersion, "/master.yaml")
+			if c.succeed {
+				if err != nil {
+					t.Fatalf("Error %v", err)
+				}
+				if path != c.exp {
+					t.Fatalf("Got %s expected %s", path, c.exp)
+				}
+			} else {
+				if err == nil {
+					t.Fatalf("Expected Error, but none")
+				}
 			}
-			if path != c.exp {
-				t.Fatalf("Got %s expected %s", path, c.exp)
+		})
+	}
+}
+
+func TestDecrementVersion(t *testing.T) {
+
+	cases := []struct {
+		kubeVersion string
+		succeed     bool
+		exp         string
+	}{
+		{kubeVersion: "1.13", succeed: true, exp: "1.12"},
+		{kubeVersion: "1.15", succeed: true, exp: "1.14"},
+		{kubeVersion: "1.11", succeed: true, exp: "1.10"},
+		{kubeVersion: "1.1", succeed: true, exp: ""},
+		{kubeVersion: "invalid", succeed: false, exp: ""},
+	}
+	for _, c := range cases {
+		rv := decrementVersion(c.kubeVersion)
+		if c.succeed {
+			if c.exp != rv {
+				t.Fatalf("decrementVersion(%q) - Got %q expected %s", c.kubeVersion, rv, c.exp)
+			}
+		} else {
+			if len(rv) > 0 {
+				t.Fatalf("decrementVersion(%q) - Expected empty string but Got %s", c.kubeVersion, rv)
+			}
+		}
+	}
+}
+
+func TestGetYamlFilesFromDir(t *testing.T) {
+	cfgDir, err := ioutil.TempDir("", "kube-bench-test")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory")
+	}
+	defer os.RemoveAll(cfgDir)
+
+	d := filepath.Join(cfgDir, "cis-1.4")
+	err = os.Mkdir(d, 0766)
+	if err != nil {
+		t.Fatalf("Failed to create temp dir")
+	}
+
+	err = ioutil.WriteFile(filepath.Join(d, "something.yaml"), []byte("hello world"), 0666)
+	if err != nil {
+		t.Fatalf("error writing file %v", err)
+	}
+	err = ioutil.WriteFile(filepath.Join(d, "config.yaml"), []byte("hello world"), 0666)
+	if err != nil {
+		t.Fatalf("error writing file %v", err)
+	}
+
+	files, err := getYamlFilesFromDir(d)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("Expected to find one file, found %d", len(files))
+	}
+
+	if files[0] != filepath.Join(d, "something.yaml") {
+		t.Fatalf("Expected to find something.yaml, found %s", files[0])
+	}
+}
+
+func Test_getPlatformNameFromKubectlOutput(t *testing.T) {
+	type args struct {
+		s string
+	}
+	tests := []struct {
+		name string
+		args args
+		want string
+	}{
+		{
+			name: "eks",
+			args: args{s: "v1.17.9-eks-4c6976"},
+			want: "eks",
+		},
+		{
+			name: "gke",
+			args: args{s: "v1.17.6-gke.1"},
+			want: "gke",
+		},
+		{
+			name: "unknown",
+			args: args{s: "v1.17.6"},
+			want: "",
+		},
+		{
+			name: "empty string",
+			args: args{s: ""},
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := getPlatformNameFromVersion(tt.args.s); got != tt.want {
+				t.Errorf("getPlatformNameFromKubectlOutput() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_getPlatformBenchmarkVersion(t *testing.T) {
+	type args struct {
+		platform string
+	}
+	tests := []struct {
+		name string
+		args args
+		want string
+	}{
+		{
+			name: "eks",
+			args: args{
+				platform: "eks",
+			},
+			want: "eks-1.0",
+		},
+		{
+			name: "gke",
+			args: args{
+				platform: "gke",
+			},
+			want: "gke-1.0",
+		},
+		{
+			name: "unknown",
+			args: args{
+				platform: "rh",
+			},
+			want: "",
+		},
+		{
+			name: "empty",
+			args: args{
+				platform: "",
+			},
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := getPlatformBenchmarkVersion(tt.args.platform); got != tt.want {
+				t.Errorf("getPlatformBenchmarkVersion() = %v, want %v", got, tt.want)
 			}
 		})
 	}

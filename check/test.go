@@ -15,11 +15,17 @@
 package check
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/golang/glog"
+	yaml "gopkg.in/yaml.v2"
+	"k8s.io/client-go/util/jsonpath"
 )
 
 // test:
@@ -32,17 +38,39 @@ import (
 type binOp string
 
 const (
-	and binOp = "and"
-	or        = "or"
+	and                   binOp = "and"
+	or                          = "or"
+	defaultArraySeparator       = ","
+)
+
+type tests struct {
+	TestItems []*testItem `yaml:"test_items"`
+	BinOp     binOp       `yaml:"bin_op"`
+}
+
+type AuditUsed string
+
+const (
+	AuditCommand AuditUsed = "auditCommand"
+	AuditConfig AuditUsed = "auditConfig"
+	AuditEnv AuditUsed = "auditEnv"
 )
 
 type testItem struct {
-	Flag    string
-	Output  string
-	Value   string
-	Set     bool
-	Compare compare
+	Flag             string
+	Env              string
+	Path             string
+	Output           string
+	Value            string
+	Set              bool
+	Compare          compare
+	isMultipleOutput bool
+	auditUsed  AuditUsed
 }
+
+type envTestItem testItem
+type pathTestItem testItem
+type flagTestItem testItem
 
 type compare struct {
 	Op    string
@@ -50,145 +78,350 @@ type compare struct {
 }
 
 type testOutput struct {
-	testResult   bool
-	actualResult string
+	testResult     bool
+	found      bool
+	actualResult   string
+	ExpectedResult string
 }
 
-func (t *testItem) execute(s string) *testOutput {
-	result := &testOutput{}
-	match := strings.Contains(s, t.Flag)
+func failTestItem(s string) *testOutput {
+	return &testOutput{testResult: false, actualResult: s}
+}
 
-	if t.Set {
-		var flagVal string
-		isset := match
+func (t testItem) value() string {
+	if t.auditUsed == AuditConfig {
+		return t.Path
+	}
 
-		if isset && t.Compare.Op != "" {
-			// Expects flags in the form;
-			// --flag=somevalue
-			// --flag
-			// somevalue
-			//pttn := `(` + t.Flag + `)(=)*([^\s,]*) *`
-			pttn := `(` + t.Flag + `)(=)*([^\s]*) *`
-			flagRe := regexp.MustCompile(pttn)
-			vals := flagRe.FindStringSubmatch(s)
+	if t.auditUsed == AuditEnv {
+		return t.Env
+	}
 
-			if len(vals) > 0 {
-				if vals[3] != "" {
-					flagVal = vals[3]
-				} else {
-					flagVal = vals[1]
-				}
+	return t.Flag
+}
+
+func (t testItem) findValue(s string) (match bool, value string, err error) {
+	if t.auditUsed == AuditEnv {
+		et := envTestItem(t)
+		return et.findValue(s)
+	}
+
+	if t.auditUsed == AuditConfig {
+		pt := pathTestItem(t)
+		return pt.findValue(s)
+	}
+
+	ft := flagTestItem(t)
+	return ft.findValue(s)
+}
+
+func (t flagTestItem) findValue(s string) (match bool, value string, err error) {
+	if s == "" || t.Flag == "" {
+		return
+	}
+	match = strings.Contains(s, t.Flag)
+	if match {
+		// Expects flags in the form;
+		// --flag=somevalue
+		// flag: somevalue
+		// --flag
+		// somevalue
+		pttn := `(` + t.Flag + `)(=|: *)*([^\s]*) *`
+		flagRe := regexp.MustCompile(pttn)
+		vals := flagRe.FindStringSubmatch(s)
+
+		if len(vals) > 0 {
+			if vals[3] != "" {
+				value = vals[3]
 			} else {
-				fmt.Fprintf(os.Stderr, "invalid flag in testitem definition")
-				os.Exit(1)
-			}
-
-			result.actualResult = strings.ToLower(flagVal)
-			switch t.Compare.Op {
-			case "eq":
-				value := strings.ToLower(flagVal)
-				// Do case insensitive comparaison for booleans ...
-				if value == "false" || value == "true" {
-					result.testResult = value == t.Compare.Value
+				// --bool-flag
+				if strings.HasPrefix(t.Flag, "--") {
+					value = "true"
 				} else {
-					result.testResult = flagVal == t.Compare.Value
+					value = vals[1]
 				}
-
-			case "noteq":
-				value := strings.ToLower(flagVal)
-				// Do case insensitive comparaison for booleans ...
-				if value == "false" || value == "true" {
-					result.testResult = !(value == t.Compare.Value)
-				} else {
-					result.testResult = !(flagVal == t.Compare.Value)
-				}
-
-			case "gt":
-				a, b := toNumeric(flagVal, t.Compare.Value)
-				result.testResult = a > b
-
-			case "gte":
-				a, b := toNumeric(flagVal, t.Compare.Value)
-				result.testResult = a >= b
-
-			case "lt":
-				a, b := toNumeric(flagVal, t.Compare.Value)
-				result.testResult = a < b
-
-			case "lte":
-				a, b := toNumeric(flagVal, t.Compare.Value)
-				result.testResult = a <= b
-
-			case "has":
-				result.testResult = strings.Contains(flagVal, t.Compare.Value)
-
-			case "nothave":
-				result.testResult = !strings.Contains(flagVal, t.Compare.Value)
 			}
 		} else {
-			result.testResult = isset
+			err = fmt.Errorf("invalid flag in testItem definition: %s", s)
 		}
-
-	} else {
-		notset := !match
-		result.testResult = notset
 	}
+	glog.V(3).Infof("In flagTestItem.findValue %s, match %v, s %s, t.Flag %s", value, match, s, t.Flag)
+
+	return match, value, err
+}
+
+func (t pathTestItem) findValue(s string) (match bool, value string, err error) {
+	var jsonInterface interface{}
+
+	err = unmarshal(s, &jsonInterface)
+	if err != nil {
+		return false, "", fmt.Errorf("failed to load YAML or JSON from input \"%s\": %v", s, err)
+	}
+
+	value, err = executeJSONPath(t.Path, &jsonInterface)
+	if err != nil {
+		return false, "", fmt.Errorf("unable to parse path expression \"%s\": %v", t.Path, err)
+	}
+
+	glog.V(3).Infof("In pathTestItem.findValue %s", value)
+	match = value != ""
+	return match, value, err
+}
+
+func (t envTestItem) findValue(s string) (match bool, value string, err error) {
+	if s != "" && t.Env != "" {
+		r, _ := regexp.Compile(fmt.Sprintf("%s=.*(?:$|\\n)", t.Env))
+		out := r.FindString(s)
+		out = strings.Replace(out, "\n", "", 1)
+		out = strings.Replace(out, fmt.Sprintf("%s=", t.Env), "", 1)
+
+		if len(out) > 0 {
+			match = true
+			value = out
+		}else{
+			match = false
+			value = ""
+		}
+	}
+	return match, value, nil
+}
+
+func (t testItem) execute(s string) *testOutput {
+	result := &testOutput{}
+	s = strings.TrimRight(s, " \n")
+
+	// If the test has output that should be evaluated for each row
+	var output []string
+	if t.isMultipleOutput {
+		output = strings.Split(s, "\n")
+	} else {
+		output = []string{s}
+	}
+
+	for _, op := range output {
+		result = t.evaluate(op)
+		// If the test failed for the current row, no need to keep testing for this output
+		if !result.testResult {
+			break
+		}
+	}
+
+	result.actualResult = s
 	return result
 }
 
-type tests struct {
-	TestItems []*testItem `yaml:"test_items"`
-	BinOp     binOp       `yaml:"bin_op"`
+func (t testItem) evaluate(s string) *testOutput {
+	result := &testOutput{}
+
+	match, value, err := t.findValue(s)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, err.Error())
+		return failTestItem(err.Error())
+	}
+
+	if t.Set {
+		if match && t.Compare.Op != "" {
+			result.ExpectedResult, result.testResult = compareOp(t.Compare.Op, value, t.Compare.Value)
+		} else {
+			result.ExpectedResult = fmt.Sprintf("'%s' is present", t.value())
+			result.testResult = match
+		}
+	} else {
+		result.ExpectedResult = fmt.Sprintf("'%s' is not present", t.value())
+		result.testResult = !match
+	}
+
+	result.found = match
+	glog.V(3).Info(fmt.Sprintf("found %v", result.found))
+
+	return result
 }
 
-func (ts *tests) execute(s string) *testOutput {
-	finalOutput := &testOutput{}
+func compareOp(tCompareOp string, flagVal string, tCompareValue string) (string, bool) {
 
-	res := make([]testOutput, len(ts.TestItems))
-	if len(res) == 0 {
-		return finalOutput
-	}
+	expectedResultPattern := ""
+	testResult := false
 
-	for i, t := range ts.TestItems {
-		res[i] = *(t.execute(s))
-	}
-
-	var result bool
-	// If no binary operation is specified, default to AND
-	switch ts.BinOp {
-	default:
-		fmt.Fprintf(os.Stderr, "unknown binary operator for tests %s\n", ts.BinOp)
-		os.Exit(1)
-	case and, "":
-		result = true
-		for i := range res {
-			result = result && res[i].testResult
+	switch tCompareOp {
+	case "eq":
+		expectedResultPattern = "'%s' is equal to '%s'"
+		value := strings.ToLower(flagVal)
+		// Do case insensitive comparaison for booleans ...
+		if value == "false" || value == "true" {
+			testResult = value == tCompareValue
+		} else {
+			testResult = flagVal == tCompareValue
 		}
-	case or:
-		result = false
-		for i := range res {
-			result = result || res[i].testResult
+
+	case "noteq":
+		expectedResultPattern = "'%s' is not equal to '%s'"
+		value := strings.ToLower(flagVal)
+		// Do case insensitive comparaison for booleans ...
+		if value == "false" || value == "true" {
+			testResult = !(value == tCompareValue)
+		} else {
+			testResult = !(flagVal == tCompareValue)
 		}
+
+	case "gt", "gte", "lt", "lte":
+		a, b, err := toNumeric(flagVal, tCompareValue)
+		if err != nil {
+			glog.V(1).Infof(fmt.Sprintf("Not numeric value - flag: %q - compareValue: %q %v\n", flagVal, tCompareValue, err))
+			return "Invalid Number(s) used for comparison", false
+		}
+		switch tCompareOp {
+		case "gt":
+			expectedResultPattern = "%s is greater than %s"
+			testResult = a > b
+
+		case "gte":
+			expectedResultPattern = "%s is greater or equal to %s"
+			testResult = a >= b
+
+		case "lt":
+			expectedResultPattern = "%s is lower than %s"
+			testResult = a < b
+
+		case "lte":
+			expectedResultPattern = "%s is lower or equal to %s"
+			testResult = a <= b
+		}
+
+	case "has":
+		expectedResultPattern = "'%s' has '%s'"
+		testResult = strings.Contains(flagVal, tCompareValue)
+
+	case "nothave":
+		expectedResultPattern = " '%s' not have '%s'"
+		testResult = !strings.Contains(flagVal, tCompareValue)
+
+	case "regex":
+		expectedResultPattern = " '%s' matched by '%s'"
+		opRe := regexp.MustCompile(tCompareValue)
+		testResult = opRe.MatchString(flagVal)
+
+	case "valid_elements":
+		expectedResultPattern = "'%s' contains valid elements from '%s'"
+		s := splitAndRemoveLastSeparator(flagVal, defaultArraySeparator)
+		target := splitAndRemoveLastSeparator(tCompareValue, defaultArraySeparator)
+		testResult = allElementsValid(s, target)
+
+	case "bitmask":
+		expectedResultPattern = "bitmask '%s' AND '%s'"
+		requested, err := strconv.ParseInt(flagVal, 8, 64)
+		if err != nil {
+			glog.V(1).Infof(fmt.Sprintf("Not numeric value - flag: %q - compareValue: %q %v\n", flagVal, tCompareValue, err))
+			return fmt.Sprintf("Not numeric value - flag: %s", flagVal), false
+		}
+		max, err := strconv.ParseInt(tCompareValue, 8, 64)
+		if err != nil {
+			glog.V(1).Infof(fmt.Sprintf("Not numeric value - flag: %q - compareValue: %q %v\n", flagVal, tCompareValue, err))
+			return fmt.Sprintf("Not numeric value - flag: %s", tCompareValue), false
+		}
+		testResult = (max & requested) == requested
+	}
+	if expectedResultPattern == "" {
+		return expectedResultPattern, testResult
 	}
 
-	finalOutput.testResult = result
-	finalOutput.actualResult = res[0].actualResult
-
-	return finalOutput
+	return fmt.Sprintf(expectedResultPattern, flagVal, tCompareValue), testResult
 }
 
-func toNumeric(a, b string) (c, d int) {
-	var err error
-	c, err = strconv.Atoi(a)
+func unmarshal(s string, jsonInterface *interface{}) error {
+	data := []byte(s)
+	err := json.Unmarshal(data, jsonInterface)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error converting %s: %s\n", a, err)
-		os.Exit(1)
+		err := yaml.Unmarshal(data, jsonInterface)
+		if err != nil {
+			return err
+		}
 	}
-	d, err = strconv.Atoi(b)
+	return nil
+}
+
+func executeJSONPath(path string, jsonInterface interface{}) (string, error) {
+	j := jsonpath.New("jsonpath")
+	j.AllowMissingKeys(true)
+	err := j.Parse(path)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error converting %s: %s\n", b, err)
-		os.Exit(1)
+		return "", err
 	}
 
-	return c, d
+	buf := new(bytes.Buffer)
+	err = j.Execute(buf, jsonInterface)
+	if err != nil {
+		return "", err
+	}
+	jsonpathResult := buf.String()
+	return jsonpathResult, nil
+}
+
+func allElementsValid(s, t []string) bool {
+	sourceEmpty := len(s) == 0
+	targetEmpty := len(t) == 0
+
+	if sourceEmpty && targetEmpty {
+		return true
+	}
+
+	// XOR comparison -
+	//     if either value is empty and the other is not empty,
+	//     not all elements are valid
+	if (sourceEmpty || targetEmpty) && !(sourceEmpty && targetEmpty) {
+		return false
+	}
+
+	for _, sv := range s {
+		found := false
+		for _, tv := range t {
+			if sv == tv {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func splitAndRemoveLastSeparator(s, sep string) []string {
+	cleanS := strings.TrimRight(strings.TrimSpace(s), sep)
+	if len(cleanS) == 0 {
+		return []string{}
+	}
+
+	ts := strings.Split(cleanS, sep)
+	for i := range ts {
+		ts[i] = strings.TrimSpace(ts[i])
+	}
+
+	return ts
+}
+
+func toNumeric(a, b string) (c, d int, err error) {
+	c, err = strconv.Atoi(strings.TrimSpace(a))
+	if err != nil {
+		return -1, -1, fmt.Errorf("toNumeric - error converting %s: %s", a, err)
+	}
+	d, err = strconv.Atoi(strings.TrimSpace(b))
+	if err != nil {
+		return -1, -1, fmt.Errorf("toNumeric - error converting %s: %s", b, err)
+	}
+
+	return c, d, nil
+}
+
+func (t *testItem) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	type buildTest testItem
+
+	// Make Set parameter to be true by default.
+	newTestItem := buildTest{Set: true}
+	err := unmarshal(&newTestItem)
+	if err != nil {
+		return err
+	}
+	*t = testItem(newTestItem)
+	return nil
 }
